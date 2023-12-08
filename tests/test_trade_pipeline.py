@@ -10,7 +10,8 @@ from api.tasks import cache_market
 from control.models import BalanceLog
 from control.tasks import compute_node_balance, do_accounting
 from tests.test_api import BaseAPITestCase
-from tests.utils.node import set_up_regtest_network
+from tests.utils.node import add_invoice, set_up_regtest_network
+from tests.utils.pgp import sign_message
 from tests.utils.trade import Trade
 
 
@@ -256,6 +257,10 @@ class TradeTest(BaseAPITestCase):
         self.assertEqual(
             data["ur_nick"], read_file(f"tests/robots/{robot_index}/nickname")
         )
+        self.assertEqual(
+            data["maker_nick"], read_file(f"tests/robots/{robot_index}/nickname")
+        )
+        self.assertIsHash(data["maker_hash_id"])
         self.assertIsInstance(data["satoshis_now"], int)
         self.assertFalse(data["maker_locked"])
         self.assertFalse(data["taker_locked"])
@@ -341,6 +346,8 @@ class TradeTest(BaseAPITestCase):
         self.assertEqual(
             data["maker_nick"], read_file(f"tests/robots/{trade.maker_index}/nickname")
         )
+        self.assertIsHash(data["maker_hash_id"])
+        self.assertIsHash(data["taker_hash_id"])
         self.assertEqual(data["maker_status"], "Active")
         self.assertEqual(data["taker_status"], "Active")
         self.assertFalse(data["is_maker"])
@@ -758,6 +765,220 @@ class TradeTest(BaseAPITestCase):
         )
         self.assertEqual(data["expiry_reason"], Order.ExpiryReasons.NINVOI)
 
+    def test_chat(self):
+        """
+        Tests the chatting REST functionality
+        """
+        path = reverse("chat")
+        message = (
+            "Example message string. Note clients will verify expect only PGP messages."
+        )
+
+        # Run a successful trade
+        trade = Trade(self.client)
+        trade.publish_order()
+        trade.take_order()
+        trade.lock_taker_bond()
+        trade.lock_escrow(trade.taker_index)
+        trade.submit_payout_invoice(trade.maker_index)
+
+        params = f"?order_id={trade.order_id}"
+        maker_headers = trade.get_robot_auth(trade.maker_index)
+        taker_headers = trade.get_robot_auth(trade.taker_index)
+        maker_nick = read_file(f"tests/robots/{trade.maker_index}/nickname")
+        taker_nick = read_file(f"tests/robots/{trade.taker_index}/nickname")
+
+        # Get empty chatroom as maker
+        response = self.client.get(path + params, **maker_headers)
+        self.assertResponse(response)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["messages"], [])
+        self.assertTrue(response.json()["peer_connected"])
+
+        # Get empty chatroom as taker
+        response = self.client.get(path + params, **taker_headers)
+        self.assertResponse(response)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["messages"], [])
+        self.assertTrue(response.json()["peer_connected"])
+
+        # Post new message as maker
+        body = {"PGP_message": message, "order_id": trade.order_id, "offset": 0}
+        response = self.client.post(path, data=body, **maker_headers)
+        self.assertResponse(response)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["messages"][0]["message"], message)
+        self.assertTrue(response.json()["peer_connected"])
+
+        # Post new message as taker without offset, so response should not have messages.
+        body = {"PGP_message": message + " 2", "order_id": trade.order_id}
+        response = self.client.post(path, data=body, **taker_headers)
+        self.assertResponse(response)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {})  # Nothing in the response
+
+        # Get the two chatroom messages as maker
+        response = self.client.get(path + params, **maker_headers)
+        self.assertResponse(response)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["peer_connected"])
+        self.assertEqual(response.json()["messages"][0]["message"], message)
+        self.assertEqual(response.json()["messages"][1]["message"], message + " 2")
+        self.assertEqual(response.json()["messages"][0]["nick"], maker_nick)
+        self.assertEqual(response.json()["messages"][1]["nick"], taker_nick)
+
+        # Cancel order to avoid leaving pending HTLCs after a successful test
+        trade.cancel_order(trade.maker_index)
+        trade.cancel_order(trade.taker_index)
+
+    def test_order_expires_after_only_taker_messaged(self):
+        """
+        Tests the expiration of an order in chat where maker never messaged
+        """
+        trade = Trade(self.client)
+        trade.publish_order()
+        trade.take_order()
+        trade.lock_taker_bond()
+        trade.lock_escrow(trade.taker_index)
+        trade.submit_payout_invoice(trade.maker_index)
+
+        path = reverse("chat")
+        message = "Unencrypted message from taker"
+        params = f"?order_id={trade.order_id}"
+        taker_headers = trade.get_robot_auth(trade.taker_index)
+
+        # Post new message as taker
+        body = {"PGP_message": message, "order_id": trade.order_id}
+        self.client.post(path + params, data=body, **taker_headers)
+
+        # Change order expiry to now
+        order = Order.objects.get(id=trade.response.json()["id"])
+        order.expires_at = datetime.now()
+        order.save()
+
+        # Make orders expire
+        trade.clean_orders()
+
+        trade.get_order()
+        data = trade.response.json()
+
+        self.assertEqual(trade.response.status_code, 200)
+        self.assertResponse(trade.response)
+
+        # Verify taker lost dispute automatically
+        self.assertEqual(
+            data["status"],
+            Order.Status.MLD,
+        )
+
+    def test_order_expires_after_only_maker_messaged(self):
+        """
+        Tests the expiration of an order in chat where taker never messaged
+        """
+        trade = Trade(self.client)
+        trade.publish_order()
+        trade.take_order()
+        trade.lock_taker_bond()
+        trade.lock_escrow(trade.taker_index)
+        trade.submit_payout_invoice(trade.maker_index)
+
+        path = reverse("chat")
+        message = "Unencrypted message from taker"
+        params = f"?order_id={trade.order_id}"
+        maker_headers = trade.get_robot_auth(trade.maker_index)
+
+        # Post new message as taker
+        body = {"PGP_message": message, "order_id": trade.order_id}
+        self.client.post(path + params, data=body, **maker_headers)
+
+        # Change order expiry to now
+        order = Order.objects.get(id=trade.response.json()["id"])
+        order.expires_at = datetime.now()
+        order.save()
+
+        # Make orders expire
+        trade.clean_orders()
+
+        trade.get_order()
+        data = trade.response.json()
+
+        self.assertEqual(trade.response.status_code, 200)
+        self.assertResponse(trade.response)
+
+        # Verify taker lost dispute automatically
+        self.assertEqual(
+            data["status"],
+            Order.Status.TLD,
+        )
+
+    def test_withdraw_reward_after_unilateral_cancel(self):
+        """
+        Tests withdraw rewards as taker after maker cancels order unilaterally
+        """
+        trade = Trade(self.client)
+        trade.publish_order()
+        trade.take_order()
+        trade.lock_taker_bond()
+        trade.cancel_order(trade.maker_index)
+
+        # Fetch amount of rewards for taker
+        path = reverse("robot")
+        taker_headers = trade.get_robot_auth(trade.maker_index)
+        response = self.client.get(path, **taker_headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertResponse(response)
+        self.assertIsInstance(response.json()["earned_rewards"], int)
+
+        # Submit reward invoice
+        path = reverse("reward")
+        invoice = add_invoice("robot", response.json()["earned_rewards"])
+        signed_payout_invoice = sign_message(
+            invoice,
+            passphrase_path=f"tests/robots/{trade.taker_index}/token",
+            private_key_path=f"tests/robots/{trade.taker_index}/enc_priv_key",
+        )
+        body = {
+            "invoice": signed_payout_invoice,
+        }
+
+        response = self.client.post(path, body, **taker_headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertResponse(response)
+        self.assertTrue(response.json()["successful_withdrawal"])
+
+    def test_order_expires_after_fiat_sent(self):
+        """
+        Tests the expiration of an order after fiat sent is confirmed
+        """
+        trade = Trade(self.client)
+        trade.publish_order()
+        trade.take_order()
+        trade.lock_taker_bond()
+        trade.lock_escrow(trade.taker_index)
+        trade.submit_payout_address(trade.maker_index)
+        trade.confirm_fiat(trade.maker_index)
+
+        # Change order expiry to now
+        order = Order.objects.get(id=trade.response.json()["id"])
+        order.expires_at = datetime.now()
+        order.save()
+
+        # Make orders expire
+        trade.clean_orders()
+
+        trade.get_order()
+        data = trade.response.json()
+
+        self.assertEqual(trade.response.status_code, 200)
+        self.assertResponse(trade.response)
+
+        self.assertEqual(
+            data["status"],
+            Order.Status.DIS,
+        )
+
     def test_ticks(self):
         """
         Tests the historical ticks serving endpoint after creating a contract
@@ -831,6 +1052,7 @@ class TradeTest(BaseAPITestCase):
 
         self.assertIsInstance(datetime.fromisoformat(data[0]["created_at"]), datetime)
         self.assertIsInstance(datetime.fromisoformat(data[0]["expires_at"]), datetime)
+        self.assertIsHash(data[0]["maker_hash_id"])
         self.assertIsNone(data[0]["amount"])
         self.assertAlmostEqual(
             float(data[0]["min_amount"]), trade.maker_form["min_amount"]
